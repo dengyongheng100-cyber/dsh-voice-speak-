@@ -4,8 +4,8 @@
  * Host-only 插件，无 UI。
  */
 import { execFile } from "node:child_process";
-import { writeFileSync, mkdtempSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { writeFileSync, mkdtempSync, readFileSync, existsSync } from "node:fs";
+import { tmpdir, homedir } from "node:os";
 import { join } from "node:path";
 
 const defineTool = (def) => def;
@@ -16,10 +16,14 @@ export const inject = ["tools"];
 // Python 解释器路径（需装有 httpx/numpy/sounddevice；可用环境变量覆盖）
 const PYTHON = process.env.VOICE_PYTHON ||
   "C:\\Users\\win11abc\\.dsh\\dsh-runtimes\\dsh-primary-runtime\\dependencies\\python\\python.exe";
-// 从环境变量读取（不要写死密钥！部署时 export 设置）
-const ZHIPU_API_KEY = process.env.ZHIPU_API_KEY || "";
-// 克隆音色 ID（在智谱控制台「音色复刻」得到；也可用官方内置音色，如 tongtong / xiaochen 等）
-const VOICE_ID = process.env.ZHIPU_VOICE_ID || "tongtong";
+// 读取配置：优先环境变量，其次本地私有文件（不进 git） ~/.dsh-voice-speak.local.json
+let _localCfg = {};
+try {
+  const cf = join(homedir(), ".dsh-voice-speak.local.json");
+  if (existsSync(cf)) _localCfg = JSON.parse(readFileSync(cf, "utf-8"));
+} catch { /* ignore */ }
+const ZHIPU_API_KEY = process.env.ZHIPU_API_KEY || _localCfg.ZHIPU_API_KEY || "";
+const VOICE_ID = process.env.ZHIPU_VOICE_ID || _localCfg.ZHIPU_VOICE_ID || "tongtong";
 
 // 驱动：读文本文件 -> 智谱 TTS 合成 wav -> 播放 -> 退出
 const PLAY_DRIVER = String.raw`
@@ -32,21 +36,47 @@ if not text:
 r = httpx.post("https://open.bigmodel.cn/api/paas/v4/audio/speech",
     headers={"Authorization": "Bearer " + api_key, "Content-Type": "application/json"},
     json={"model": "glm-tts", "input": text, "voice": voice, "response_format": "wav"},
-    timeout=60)
+    timeout=60, trust_env=False)  # 智谱是国内接口，禁用系统代理，避免本地代理抖动导致失败
 if r.status_code != 200 or len(r.content) < 1000:
     print("TTS_FAIL", r.status_code, r.text[:200]); sys.exit(1)
 w = wave.open(io.BytesIO(r.content), "rb")
 sr = w.getframerate()
-a = np.frombuffer(w.readframes(w.getnframes()), dtype=np.int16)
+a = np.frombuffer(w.readframes(w.getnframes()), dtype=np.int16).astype(np.float32)
+# --- 去除智谱 TTS 开头自带的"嘟嘟/滴滴"提示音（平顶方波 + 静音），裁到真正语音开始 ---
+hop = int(sr * 0.01)
+en = np.array([np.abs(a[i:i+hop]).mean() for i in range(0, len(a), hop)])
+def _is_flat(v):
+    return 1000 <= v <= 1250
+_start = None
+for i in range(len(en)):
+    v = en[i]
+    if v < 60 or _is_flat(v):
+        continue
+    if sum(1 for j in range(i, min(i+8, len(en))) if en[j] > 80) >= 5:
+        _start = i; break
+if _start:
+    a = a[_start*hop:]
+a = a.astype(np.int16)
 sd.play(a, sr); sd.wait()
 print("SPOKEN", len(text))
 `;
 
 function runPython(args, env) {
   return new Promise((resolve, reject) => {
-    execFile(PYTHON, args, { timeout: 120000, windowsHide: true, env: { ...process.env, ...env } },
+    // 清掉代理相关环境变量（智谱是国内接口，代理反而添乱/抖动）
+    const cleanEnv = { ...process.env, ...env };
+    for (const k of Object.keys(cleanEnv)) {
+      if (/proxy/i.test(k)) delete cleanEnv[k];
+    }
+    cleanEnv.NO_PROXY = "*";
+    cleanEnv.no_proxy = "*";
+    execFile(PYTHON, args, { timeout: 120000, windowsHide: true, env: cleanEnv },
       (err, stdout, stderr) => {
-        if (err) reject(new Error((stderr || err.message || "").slice(0, 500)));
+        if (err) {
+          const full = (stderr || err.message || "");
+          try { writeFileSync(join(tmpdir(), "dsh-voice-speak.err.log"), String(full)); } catch {}
+          reject(new Error(full.slice(-800)));
+        }
         else resolve((stdout || "").trim());
       });
   });
