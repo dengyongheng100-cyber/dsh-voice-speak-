@@ -1,1 +1,1 @@
-{ "meta": { "title": "语音朗读", "description": "让助手用微软 edge-tts 把回复朗读出来。" } }
+{ "meta": { "title": "语音朗读", "description": "让助手用智谱 GLM-TTS 把回复朗读出来，支持克隆音色、自动去除开头提示音。" } }

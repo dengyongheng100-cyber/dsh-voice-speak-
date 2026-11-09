@@ -1,6 +1,6 @@
 /**
  * @local/dsh-voice-speak
- * 注册 `speak` 工具：把文字用 智谱 GLM-TTS + 克隆音色「小翁」 合成并播放。
+ * 注册 `speak` 工具：把文字用 智谱 GLM-TTS + 当前配置的音色 合成并播放。
  * Host-only 插件，无 UI。
  */
 import { execFile } from "node:child_process";
@@ -13,15 +13,25 @@ const defineTool = (def) => def;
 export const name = "dsh-voice-speak";
 export const inject = ["tools"];
 
-// Python 解释器路径（需装有 httpx/numpy/sounddevice；可用环境变量覆盖）
-const PYTHON = process.env.VOICE_PYTHON ||
-  "C:\\Users\\win11abc\\.dsh\\dsh-runtimes\\dsh-primary-runtime\\dependencies\\python\\python.exe";
+// Python 解释器：只认环境变量 VOICE_PYTHON（需装有 httpx/numpy/sounddevice）。
+// 不在代码里写死个人路径；未设置时工具调用会返回清晰错误提示。
+const PYTHON = process.env.VOICE_PYTHON || "";
+
 // 读取配置：优先环境变量，其次本地私有文件（不进 git） ~/.dsh-voice-speak.local.json
 let _localCfg = {};
 try {
   const cf = join(homedir(), ".dsh-voice-speak.local.json");
-  if (existsSync(cf)) _localCfg = JSON.parse(readFileSync(cf, "utf-8"));
-} catch { /* ignore */ }
+  if (existsSync(cf)) {
+    // 去掉可能的 UTF-8 BOM（\ufeff），否则 JSON.parse 会失败
+    let raw = readFileSync(cf, "utf-8");
+    if (raw.charCodeAt(0) === 0xfeff) raw = raw.slice(1);
+    _localCfg = JSON.parse(raw);
+  }
+} catch (e) {
+  // 解析失败不要把 key 静默变空——写日志方便排查
+  try { writeFileSync(join(tmpdir(), "dsh-voice-speak.config.err.log"), String(e && e.stack || e)); } catch {}
+  _localCfg = {};
+}
 const ZHIPU_API_KEY = process.env.ZHIPU_API_KEY || _localCfg.ZHIPU_API_KEY || "";
 const VOICE_ID = process.env.ZHIPU_VOICE_ID || _localCfg.ZHIPU_VOICE_ID || "tongtong";
 
@@ -85,7 +95,7 @@ function runPython(args, env) {
 export function apply(ctx) {
   ctx.tools.register(defineTool({
     name: "speak",
-    description: "把一段文字用语音朗读出来并播放（使用克隆音色「小翁」，智谱 GLM-TTS）。需要在回复用户时让对方'听到'内容就调用它。",
+    description: "把一段文字用语音朗读出来并播放（智谱 GLM-TTS，使用当前配置的音色）。需要在回复用户时让对方'听到'内容就调用它。",
     parameters: {
       text: { type: "string", description: "要朗读的文字（中文/英文均可）。" },
     },
@@ -96,6 +106,8 @@ export function apply(ctx) {
     async execute(args) {
       const text = String(args.text ?? "");
       if (!text.trim()) return "没内容可念。";
+      if (!ZHIPU_API_KEY) return "朗读失败：未配置 ZHIPU_API_KEY（环境变量或本地配置文件）。";
+      if (!PYTHON) return "朗读失败：未设置环境变量 VOICE_PYTHON（指向装有 httpx/numpy/sounddevice 的 Python）。";
       const dir = mkdtempSync(join(tmpdir(), "dsh-tts-"));
       const textFile = join(dir, "say.txt");
       const driverFile = join(dir, "play.py");
